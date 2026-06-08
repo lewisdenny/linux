@@ -139,6 +139,8 @@ struct asus_drvdata {
 };
 
 static int asus_report_battery(struct asus_drvdata *, u8 *, int);
+static void asus_kbd_backlight_set(struct led_classdev *led_cdev,
+				   enum led_brightness brightness);
 
 static const struct asus_touchpad_info asus_i2c_tp = {
 	.max_x = 2794,
@@ -317,6 +319,26 @@ static int asus_e1239t_event(struct asus_drvdata *drvdat, u8 *data, int size)
 	return 0;
 }
 
+static void asus_zenbook_duo_kbd_backlight_cycle(struct asus_drvdata *drvdata)
+{
+	struct asus_kbd_leds *led = drvdata->kbd_backlight;
+	enum led_brightness brightness;
+	unsigned long flags;
+
+	if (!led)
+		return;
+
+	spin_lock_irqsave(&led->lock, flags);
+	brightness = led->brightness;
+	spin_unlock_irqrestore(&led->lock, flags);
+
+	brightness++;
+	if (brightness > led->cdev.max_brightness)
+		brightness = 0;
+
+	asus_kbd_backlight_set(&led->cdev, brightness);
+}
+
 static int asus_event(struct hid_device *hdev, struct hid_field *field,
 		      struct hid_usage *usage, __s32 value)
 {
@@ -343,6 +365,10 @@ static int asus_raw_event(struct hid_device *hdev,
 
 	if (drvdata->quirks & QUIRK_MEDION_E1239T)
 		return asus_e1239t_event(drvdata, data, size);
+
+	if ((drvdata->quirks & QUIRK_ZENBOOK_DUO_KEYBOARD) &&
+	    size >= 2 && data[0] == FEATURE_KBD_REPORT_ID && data[1] == 0xc7)
+		asus_zenbook_duo_kbd_backlight_cycle(drvdata);
 
 	/*
 	 * Skip these report ID, the device emits a continuous stream associated
