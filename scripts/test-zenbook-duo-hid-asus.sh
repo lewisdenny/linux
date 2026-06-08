@@ -178,6 +178,10 @@ grep -q 'USB_DEVICE_ID_ASUSTEK_ZENBOOK_DUO_KEYBOARD' "$module_build_dir/hid-ids.
 	die "Zenbook Duo HID IDs are missing from hid-ids.h"
 grep -q 'case 0x86:.*Zenbook Duo MyASUS' "$module_build_dir/hid-asus.c" ||
 	die "Zenbook Duo MyASUS key mapping is missing from hid-asus.c"
+grep -q 'QUIRK_ZENBOOK_DUO_KEYBOARD' "$module_build_dir/hid-asus.c" ||
+	die "Zenbook Duo descriptor quirk is missing from hid-asus.c"
+grep -q 'Injecting virtual Zenbook Duo keyboard usage page' "$module_build_dir/hid-asus.c" ||
+	die "Zenbook Duo USB vendor-interface input fixup is missing from hid-asus.c"
 
 log "Building hid-asus.ko for $kver"
 make -C "$kernel_build" M="$module_build_dir" modules
@@ -191,7 +195,7 @@ if [[ "$vermagic" != "$kver "* ]]; then
 fi
 
 aliases="$(modinfo -F alias "$ko_path" || true)"
-for product in 00001B2C 00001BF2 00001BF3; do
+for product in 00001B2C 00001B2D 00001BF2 00001BF3; do
 	if ! printf '%s\n' "$aliases" | grep -qi "v00000B05p$product"; then
 		die "built module alias table is missing ASUS product $product"
 	fi
@@ -229,7 +233,7 @@ print_matching_devices() {
 		modalias="$(cat "$dev/modalias" 2>/dev/null || true)"
 		upper="${modalias^^}"
 		case "$upper" in
-			*V00000B05P00001B2C*|*V00000B05P00001BF2*|*V00000B05P00001BF3*)
+			*V00000B05P00001B2C*|*V00000B05P00001B2D*|*V00000B05P00001BF2*|*V00000B05P00001BF3*)
 				found=1
 				name="$(cat "$dev/name" 2>/dev/null || true)"
 				if [[ -L "$dev/driver" ]]; then
@@ -239,6 +243,10 @@ print_matching_devices() {
 				fi
 				printf '  %s driver=%s name=%s modalias=%s\n' \
 					"$(basename -- "$dev")" "$driver" "$name" "$modalias"
+				for event in "$dev"/input/input*/event*; do
+					[[ -e "$event" ]] || continue
+					printf '    event node: /dev/input/%s\n' "$(basename -- "$event")"
+				done
 				;;
 		esac
 	done
@@ -272,7 +280,7 @@ print_matching_devices
 print_backlight_status
 
 if [[ $no_monitor -eq 0 && -t 0 && -t 1 ]]; then
-	printf '\nPress Enter, then press volume and keyboard-backlight keys for %s seconds.\n' "$monitor_seconds"
+	printf '\nPress Enter, then press volume, screen-brightness, and keyboard-backlight keys for %s seconds.\n' "$monitor_seconds"
 	printf 'The monitor is only a smoke test; also verify the keys in your desktop session.\n'
 	read -r -p 'Start monitor now? [Enter/Ctrl-C] ' _
 	if command -v libinput >/dev/null 2>&1; then
@@ -294,7 +302,8 @@ Patched module is loaded from:
 
 Manual checks:
   - Reattach the detachable keyboard if it was already connected.
-  - Press volume up/down/mute and keyboard backlight keys.
+  - Press volume up/down/mute, screen brightness, and keyboard backlight keys.
+  - Try direct keyboard backlight control: brightnessctl -d 'asus::kbd_backlight' set 1+
   - Check kernel logs with: dmesg -Tw | tail -80
 
 Restore stock module:

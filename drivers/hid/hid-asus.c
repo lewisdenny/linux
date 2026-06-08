@@ -93,6 +93,7 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define QUIRK_ROG_ALLY_XPAD		BIT(13)
 #define QUIRK_SKIP_REPORT_FIXUP		BIT(14)
 #define QUIRK_ROG_NKEY_LEGACY		BIT(15)
+#define QUIRK_ZENBOOK_DUO_KEYBOARD	BIT(16)
 
 #define I2C_KEYBOARD_QUIRKS			(QUIRK_FIX_NOTEBOOK_REPORT | \
 						 QUIRK_NO_INIT_REPORTS | \
@@ -1006,6 +1007,7 @@ static int asus_input_mapping(struct hid_device *hdev,
 		case 0xb3: asus_map_key_clear(KEY_PROG3);	break; /* Fn+Left next aura */
 		case 0x6a: asus_map_key_clear(KEY_F13);		break; /* Screenpad toggle */
 		case 0x4b: asus_map_key_clear(KEY_F14);		break; /* Arrows/Pg-Up/Dn toggle */
+		case 0x9c: asus_map_key_clear(KEY_F19);		break; /* Zenbook Duo screen swap */
 		case 0xa5: asus_map_key_clear(KEY_F15);		break; /* ROG Ally left back */
 		case 0xa6: asus_map_key_clear(KEY_F16);		break; /* ROG Ally QAM button */
 		case 0xa7: asus_map_key_clear(KEY_F17);		break; /* ROG Ally ROG long-press */
@@ -1297,6 +1299,23 @@ static void asus_remove(struct hid_device *hdev)
 	hid_hw_stop(hdev);
 }
 
+/*
+ * Some USB keyboards, including the Zenbook Duo UX8406MA keyboard, expose a
+ * dedicated interface for vendor-specific reports separate from the generic
+ * keyboard and consumer-control interfaces. Add a small keyboard collection so
+ * the HID core creates an input device and lets hid-asus map the vendor usages.
+ */
+static const __u8 asus_fake_keyboard_rdesc[] = {
+	0x05, 0x01,	/* Usage Page (Generic Desktop) */
+	0x09, 0x06,	/* Usage (Keyboard) */
+	0xa1, 0x01,	/* Collection (Application) */
+	0x85, 0x01,	/*   Report ID (1) */
+	0x75, 0x08,	/*   Report Size (8) */
+	0x95, 0x01,	/*   Report Count (1) */
+	0x81, 0x00,	/*   Input (Data,Arr,Abs) */
+	0xc0,		/* End Collection */
+};
+
 static const __u8 asus_g752_fixed_rdesc[] = {
         0x19, 0x00,			/*   Usage Minimum (0x00)       */
         0x2A, 0xFF, 0x00,		/*   Usage Maximum (0xFF)       */
@@ -1319,35 +1338,56 @@ static const __u8 *asus_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 		hid_info(hdev, "Fixing up Asus T100 keyb report descriptor\n");
 		rdesc[74] &= ~HID_MAIN_ITEM_CONSTANT;
 	}
-	/* For the T100CHI/T90CHI keyboard dock */
-	if (drvdata->quirks & (QUIRK_T100CHI | QUIRK_T90CHI)) {
+	/* For the T100CHI/T90CHI keyboard dock and Zenbook Duo keyboards */
+	if (drvdata->quirks & (QUIRK_T100CHI | QUIRK_T90CHI |
+			       QUIRK_ZENBOOK_DUO_KEYBOARD)) {
 		int rsize_orig;
 		int offs;
 
 		if (drvdata->quirks & QUIRK_T100CHI) {
 			rsize_orig = 403;
 			offs = 388;
-		} else {
+		} else if (drvdata->quirks & QUIRK_T90CHI) {
 			rsize_orig = 306;
 			offs = 291;
+		} else if (hid_is_usb(hdev)) {
+			rsize_orig = 90;
+			offs = 66;
+		} else {
+			rsize_orig = 257;
+			offs = 176;
 		}
 
 		/*
 		 * Change Usage (76h) to Usage Minimum (00h), Usage Maximum
-		 * (FFh) and clear the flags in the Input() byte.
-		 * Note the descriptor has a bogus 0 byte at the end so we
-		 * only need 1 extra byte.
+		 * (FFh) and clear the flags in the Input() byte. Some of
+		 * these descriptors have bogus trailing zero bytes; trim them
+		 * before adding the bytes needed for the replacement.
 		 */
 		if (*rsize == rsize_orig &&
 			rdesc[offs] == 0x09 && rdesc[offs + 1] == 0x76) {
-			*rsize = rsize_orig + 1;
-			rdesc = kmemdup(rdesc, *rsize, GFP_KERNEL);
-			if (!rdesc)
+			unsigned int new_rsize = rsize_orig + 1;
+			__u8 *new_rdesc;
+
+			if (drvdata->quirks & QUIRK_ZENBOOK_DUO_KEYBOARD) {
+				new_rsize = *rsize;
+				while (new_rsize > 0 && rdesc[new_rsize - 1] == 0)
+					new_rsize--;
+				new_rsize += 2;
+			}
+
+			new_rdesc = kzalloc(new_rsize, GFP_KERNEL);
+			if (!new_rdesc)
 				return NULL;
+			memcpy(new_rdesc, rdesc,
+			       *rsize < new_rsize ? *rsize : new_rsize);
+			*rsize = new_rsize;
+			rdesc = new_rdesc;
 
 			hid_info(hdev, "Fixing up %s keyb report descriptor\n",
 				drvdata->quirks & QUIRK_T100CHI ?
-				"T100CHI" : "T90CHI");
+				"T100CHI" : drvdata->quirks & QUIRK_T90CHI ?
+				"T90CHI" : "Zenbook Duo");
 			memmove(rdesc + offs + 4, rdesc + offs + 2, 12);
 			rdesc[offs] = 0x19;
 			rdesc[offs + 1] = 0x00;
@@ -1355,6 +1395,26 @@ static const __u8 *asus_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 			rdesc[offs + 3] = 0xff;
 			rdesc[offs + 14] = 0x00;
 		}
+	}
+
+	if ((drvdata->quirks & QUIRK_ZENBOOK_DUO_KEYBOARD) &&
+	    hid_is_usb(hdev) &&
+	    to_usb_interface(hdev->dev.parent)->altsetting->desc.bInterfaceNumber == 4) {
+		__u8 *new_rdesc;
+		size_t new_size = *rsize + sizeof(asus_fake_keyboard_rdesc);
+
+		new_rdesc = devm_kzalloc(&hdev->dev, new_size, GFP_KERNEL);
+		if (!new_rdesc)
+			return rdesc;
+
+		hid_info(hdev, "Injecting virtual Zenbook Duo keyboard usage page\n");
+
+		memcpy(new_rdesc, asus_fake_keyboard_rdesc,
+		       sizeof(asus_fake_keyboard_rdesc));
+		memcpy(new_rdesc + sizeof(asus_fake_keyboard_rdesc), rdesc, *rsize);
+
+		*rsize = new_size;
+		rdesc = new_rdesc;
 	}
 
 	if (drvdata->quirks & QUIRK_G752_KEYBOARD &&
@@ -1460,13 +1520,16 @@ static const struct hid_device_id asus_devices[] = {
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
 	{ HID_DEVICE(BUS_USB, HID_GROUP_GENERIC,
 		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_ZENBOOK_DUO_KEYBOARD),
-	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_ZENBOOK_DUO_KEYBOARD },
+	{ HID_DEVICE(BUS_BLUETOOTH, HID_GROUP_GENERIC,
+		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_ZENBOOK_DUO_KEYBOARD_BLUETOOTH),
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_ZENBOOK_DUO_KEYBOARD },
 	{ HID_DEVICE(BUS_USB, HID_GROUP_GENERIC,
 		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_ZENBOOK_DUO_KEYBOARD_2),
-	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_ZENBOOK_DUO_KEYBOARD },
 	{ HID_DEVICE(BUS_BLUETOOTH, HID_GROUP_GENERIC,
 		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_ZENBOOK_DUO_KEYBOARD_2_BLUETOOTH),
-	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_ZENBOOK_DUO_KEYBOARD },
 	{ HID_DEVICE(BUS_USB, HID_GROUP_GENERIC,
 		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_T101HA_KEYBOARD) },
 	{ }
