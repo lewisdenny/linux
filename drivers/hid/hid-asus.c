@@ -139,8 +139,6 @@ struct asus_drvdata {
 };
 
 static int asus_report_battery(struct asus_drvdata *, u8 *, int);
-static void asus_kbd_backlight_set(struct led_classdev *led_cdev,
-				   enum led_brightness brightness);
 
 static const struct asus_touchpad_info asus_i2c_tp = {
 	.max_x = 2794,
@@ -319,118 +317,9 @@ static int asus_e1239t_event(struct asus_drvdata *drvdat, u8 *data, int size)
 	return 0;
 }
 
-static void asus_report_key_press(struct input_dev *input, unsigned int code)
-{
-	input_report_key(input, code, 1);
-	input_sync(input);
-	input_report_key(input, code, 0);
-	input_sync(input);
-}
-
-static void asus_zenbook_duo_kbd_backlight_step(struct asus_drvdata *drvdata,
-						int step)
-{
-	struct asus_kbd_leds *led = drvdata->kbd_backlight;
-	enum led_brightness brightness;
-	unsigned long flags;
-
-	if (!led)
-		return;
-
-	spin_lock_irqsave(&led->lock, flags);
-	brightness = led->brightness;
-	spin_unlock_irqrestore(&led->lock, flags);
-
-	if (step > 0 && brightness < led->cdev.max_brightness)
-		brightness++;
-	else if (step < 0 && brightness > 0)
-		brightness--;
-	else
-		return;
-
-	asus_kbd_backlight_set(&led->cdev, brightness);
-}
-
-static void asus_zenbook_duo_kbd_backlight_cycle(struct asus_drvdata *drvdata)
-{
-	struct asus_kbd_leds *led = drvdata->kbd_backlight;
-	enum led_brightness brightness;
-	unsigned long flags;
-
-	if (!led)
-		return;
-
-	spin_lock_irqsave(&led->lock, flags);
-	brightness = led->brightness;
-	spin_unlock_irqrestore(&led->lock, flags);
-
-	brightness++;
-	if (brightness > led->cdev.max_brightness)
-		brightness = 0;
-
-	asus_kbd_backlight_set(&led->cdev, brightness);
-}
-
-static int asus_zenbook_duo_raw_event(struct hid_device *hdev,
-				      struct asus_drvdata *drvdata,
-				      u8 *data, int size)
-{
-	unsigned int code;
-
-	if (size < 2 || data[0] != FEATURE_KBD_REPORT_ID)
-		return 0;
-
-	switch (data[1]) {
-	case 0x10:
-		code = KEY_BRIGHTNESSDOWN;
-		break;
-	case 0x20:
-		code = KEY_BRIGHTNESSUP;
-		break;
-	case 0xc4:
-		code = KEY_KBDILLUMUP;
-		asus_zenbook_duo_kbd_backlight_step(drvdata, 1);
-		break;
-	case 0xc5:
-		code = KEY_KBDILLUMDOWN;
-		asus_zenbook_duo_kbd_backlight_step(drvdata, -1);
-		break;
-	case 0xc7:
-		code = KEY_KBDILLUMTOGGLE;
-		asus_zenbook_duo_kbd_backlight_cycle(drvdata);
-		break;
-	default:
-		hid_info_ratelimited(hdev,
-				     "Zenbook Duo unhandled 0x5a report: %*ph\n",
-				     min(size, 16), data);
-		return 0;
-	}
-
-	if (!drvdata->input) {
-		hid_warn_ratelimited(hdev,
-				     "Zenbook Duo 0x5a report 0x%02x has no input device\n",
-				     data[1]);
-		return 0;
-	}
-
-	hid_info(hdev, "Zenbook Duo raw 0x5a report 0x%02x -> key %u\n",
-		 data[1], code);
-	asus_report_key_press(drvdata->input, code);
-	return 1;
-}
-
 static int asus_event(struct hid_device *hdev, struct hid_field *field,
 		      struct hid_usage *usage, __s32 value)
 {
-	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
-
-	if ((drvdata->quirks & QUIRK_ZENBOOK_DUO_KEYBOARD) &&
-	    hid_is_usb(hdev) &&
-	    value &&
-	    (usage->hid & HID_USAGE_PAGE) == HID_UP_KEYBOARD &&
-	    (usage->hid & HID_USAGE) == 0x3d)
-		asus_zenbook_duo_kbd_backlight_cycle(drvdata);
-
 	if ((usage->hid & HID_USAGE_PAGE) == HID_USAGE_PAGE_VENDOR &&
 	    (usage->hid & HID_USAGE) != 0x00 &&
 	    (usage->hid & HID_USAGE) != 0xff && !usage->type) {
@@ -454,14 +343,6 @@ static int asus_raw_event(struct hid_device *hdev,
 
 	if (drvdata->quirks & QUIRK_MEDION_E1239T)
 		return asus_e1239t_event(drvdata, data, size);
-
-	if (drvdata->quirks & QUIRK_ZENBOOK_DUO_KEYBOARD) {
-		int ret = asus_zenbook_duo_raw_event(hdev, drvdata,
-						     data, size);
-
-		if (ret)
-			return ret;
-	}
 
 	/*
 	 * Skip these report ID, the device emits a continuous stream associated
@@ -1069,14 +950,6 @@ static int asus_input_configured(struct hid_device *hdev, struct hid_input *hi)
 
 	drvdata->input = input;
 
-	if (drvdata->quirks & QUIRK_ZENBOOK_DUO_KEYBOARD) {
-		input_set_capability(input, EV_KEY, KEY_BRIGHTNESSDOWN);
-		input_set_capability(input, EV_KEY, KEY_BRIGHTNESSUP);
-		input_set_capability(input, EV_KEY, KEY_KBDILLUMDOWN);
-		input_set_capability(input, EV_KEY, KEY_KBDILLUMUP);
-		input_set_capability(input, EV_KEY, KEY_KBDILLUMTOGGLE);
-	}
-
 	return 0;
 }
 
@@ -1108,16 +981,6 @@ static int asus_input_mapping(struct hid_device *hdev,
 	     usage->hid == (HID_UP_GENDEVCTRLS | 0x0025) ||
 	     usage->hid == (HID_UP_GENDEVCTRLS | 0x0026)))
 		return -1;
-
-	if ((drvdata->quirks & QUIRK_ZENBOOK_DUO_KEYBOARD) &&
-	    hid_is_usb(hdev) &&
-	    (usage->hid & HID_USAGE_PAGE) == HID_UP_KEYBOARD) {
-		switch (usage->hid & HID_USAGE) {
-		case 0x3d: asus_map_key_clear(KEY_KBDILLUMTOGGLE);	return 1; /* F4 */
-		case 0x3e: asus_map_key_clear(KEY_BRIGHTNESSDOWN);	return 1; /* F5 */
-		case 0x3f: asus_map_key_clear(KEY_BRIGHTNESSUP);		return 1; /* F6 */
-		}
-	}
 
 	/* ASUS-specific keyboard hotkeys and led backlight */
 	if ((usage->hid & HID_USAGE_PAGE) == HID_UP_ASUSVENDOR) {
