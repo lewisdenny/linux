@@ -127,7 +127,7 @@ if [[ "$kver" != "$expected_kernel_prefix"* && $force_kernel -ne 1 ]]; then
 	die "running kernel is '$kver'; expected ${expected_kernel_prefix}*. Use --force-kernel to override."
 fi
 
-for cmd in awk cp grep lsmod make modinfo modprobe sed timeout; do
+for cmd in awk basename cat cp dirname grep lsmod make modinfo modprobe readlink sed timeout wc; do
 	command -v "$cmd" >/dev/null 2>&1 || die "missing required command: $cmd"
 done
 
@@ -223,9 +223,105 @@ run_root insmod "$ko_path"
 [[ -d /sys/module/hid_asus ]] || die "hid_asus did not appear in /sys/module after insmod"
 log "Patched hid_asus is loaded."
 
+usb_interface_dir_for_hid_device() {
+	local path parent
+
+	path="$(readlink -f "$1" 2>/dev/null || true)"
+	[[ -n "$path" ]] || return 1
+
+	while [[ "$path" == /sys/* && "$path" != /sys ]]; do
+		if [[ -r "$path/bInterfaceNumber" ]]; then
+			printf '%s\n' "$path"
+			return 0
+		fi
+		parent="$(dirname -- "$path")"
+		[[ "$parent" != "$path" ]] || break
+		path="$parent"
+	done
+
+	return 1
+}
+
+print_hid_device_details() {
+	local dev=$1
+	local modalias=$2
+	local driver name descriptor_size iface_dir iface_num iface_class iface_subclass iface_protocol
+	local input event hidraw input_name input_phys input_keys input_ev
+
+	name="$(cat "$dev/name" 2>/dev/null || true)"
+	if [[ -L "$dev/driver" ]]; then
+		driver="$(basename -- "$(readlink -- "$dev/driver")")"
+	else
+		driver="unbound"
+	fi
+
+	printf '  %s driver=%s name=%s modalias=%s\n' \
+		"$(basename -- "$dev")" "$driver" "$name" "$modalias"
+
+	if iface_dir="$(usb_interface_dir_for_hid_device "$dev")"; then
+		iface_num="$(cat "$iface_dir/bInterfaceNumber" 2>/dev/null || printf '?')"
+		iface_class="$(cat "$iface_dir/bInterfaceClass" 2>/dev/null || printf '?')"
+		iface_subclass="$(cat "$iface_dir/bInterfaceSubClass" 2>/dev/null || printf '?')"
+		iface_protocol="$(cat "$iface_dir/bInterfaceProtocol" 2>/dev/null || printf '?')"
+		printf '    usb interface: %s class=%s subclass=%s protocol=%s\n' \
+			"$iface_num" "$iface_class" "$iface_subclass" "$iface_protocol"
+	fi
+
+	if [[ -r "$dev/report_descriptor" ]]; then
+		descriptor_size="$(wc -c < "$dev/report_descriptor" | awk '{print $1}')"
+		printf '    report descriptor bytes: %s\n' "$descriptor_size"
+	else
+		printf '    report descriptor bytes: unreadable\n'
+	fi
+
+	shopt -s nullglob
+	for hidraw in "$dev"/hidraw/hidraw*; do
+		[[ -e "$hidraw" ]] || continue
+		printf '    hidraw node: /dev/%s\n' "$(basename -- "$hidraw")"
+	done
+
+	for input in "$dev"/input/input*; do
+		[[ -d "$input" ]] || continue
+		input_name="$(cat "$input/name" 2>/dev/null || true)"
+		input_phys="$(cat "$input/phys" 2>/dev/null || true)"
+		input_ev="$(cat "$input/capabilities/ev" 2>/dev/null || true)"
+		input_keys="$(cat "$input/capabilities/key" 2>/dev/null || true)"
+		printf '    input: %s name=%s phys=%s ev=%s key=%s\n' \
+			"$(basename -- "$input")" "$input_name" "$input_phys" "$input_ev" "$input_keys"
+		for event in "$input"/event*; do
+			[[ -e "$event" ]] || continue
+			printf '      event node: /dev/input/%s\n' "$(basename -- "$event")"
+		done
+	done
+	shopt -u nullglob
+}
+
+print_asus_hid_devices() {
+	local found=0
+	local dev modalias upper
+
+	log "All visible ASUS HID devices:"
+	shopt -s nullglob
+	for dev in /sys/bus/hid/devices/*; do
+		modalias="$(cat "$dev/modalias" 2>/dev/null || true)"
+		upper="${modalias^^}"
+		case "$upper" in
+			*V00000B05P*)
+				found=1
+				print_hid_device_details "$dev" "$modalias"
+				;;
+		esac
+	done
+	shopt -u nullglob
+
+	if [[ $found -eq 0 ]]; then
+		warn "no ASUS HID devices are currently visible."
+	fi
+}
+
 print_matching_devices() {
 	local found=0
-	local dev modalias upper driver name
+	local dev modalias upper
 
 	log "Matching ASUS Zenbook Duo HID devices:"
 	shopt -s nullglob
@@ -235,18 +331,7 @@ print_matching_devices() {
 		case "$upper" in
 			*V00000B05P00001B2C*|*V00000B05P00001B2D*|*V00000B05P00001BF2*|*V00000B05P00001BF3*)
 				found=1
-				name="$(cat "$dev/name" 2>/dev/null || true)"
-				if [[ -L "$dev/driver" ]]; then
-					driver="$(basename -- "$(readlink -- "$dev/driver")")"
-				else
-					driver="unbound"
-				fi
-				printf '  %s driver=%s name=%s modalias=%s\n' \
-					"$(basename -- "$dev")" "$driver" "$name" "$modalias"
-				for event in "$dev"/input/input*/event*; do
-					[[ -e "$event" ]] || continue
-					printf '    event node: /dev/input/%s\n' "$(basename -- "$event")"
-				done
+				print_hid_device_details "$dev" "$modalias"
 				;;
 		esac
 	done
@@ -254,6 +339,20 @@ print_matching_devices() {
 
 	if [[ $found -eq 0 ]]; then
 		warn "no Zenbook Duo keyboard HID device is currently visible. Reattach the keyboard or toggle Bluetooth, then rerun this script."
+	fi
+}
+
+print_recent_kernel_logs() {
+	log "Recent ASUS/HID kernel log lines:"
+	if command -v journalctl >/dev/null 2>&1; then
+		run_root journalctl -k -b --no-pager -n 250 |
+			grep -Ei 'hid-asus|hid_asus|asus|zenbook|0b05|1b2c|1b2d|1bf2|1bf3' || true
+	elif command -v dmesg >/dev/null 2>&1; then
+		run_root dmesg -T |
+			tail -250 |
+			grep -Ei 'hid-asus|hid_asus|asus|zenbook|0b05|1b2c|1b2d|1bf2|1bf3' || true
+	else
+		warn "journalctl/dmesg unavailable; cannot print kernel logs."
 	fi
 }
 
@@ -276,8 +375,10 @@ print_backlight_status() {
 	fi
 }
 
+print_asus_hid_devices
 print_matching_devices
 print_backlight_status
+print_recent_kernel_logs
 
 if [[ $no_monitor -eq 0 && -t 0 && -t 1 ]]; then
 	printf '\nPress Enter, then press volume, screen-brightness, and keyboard-backlight keys for %s seconds.\n' "$monitor_seconds"
@@ -305,6 +406,8 @@ Manual checks:
   - Press volume up/down/mute, screen brightness, and keyboard backlight keys.
   - Try direct keyboard backlight control: brightnessctl -d 'asus::kbd_backlight' set 1+
   - Check kernel logs with: dmesg -Tw | tail -80
+  - If screen/kbd brightness still prints nothing, send the ASUS HID device,
+    report descriptor, hidraw, input, and recent kernel-log sections above.
 
 Restore stock module:
   $repo_root/scripts/test-zenbook-duo-hid-asus.sh --restore

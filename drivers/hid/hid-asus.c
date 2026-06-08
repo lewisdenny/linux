@@ -1316,6 +1316,22 @@ static const __u8 asus_fake_keyboard_rdesc[] = {
 	0xc0,		/* End Collection */
 };
 
+static bool asus_rdesc_contains(const __u8 *rdesc, unsigned int rsize,
+				const __u8 *needle, size_t needle_size)
+{
+	size_t i;
+
+	if (needle_size > rsize)
+		return false;
+
+	for (i = 0; i <= rsize - needle_size; i++) {
+		if (!memcmp(rdesc + i, needle, needle_size))
+			return true;
+	}
+
+	return false;
+}
+
 static const __u8 asus_g752_fixed_rdesc[] = {
         0x19, 0x00,			/*   Usage Minimum (0x00)       */
         0x2A, 0xFF, 0x00,		/*   Usage Maximum (0xFF)       */
@@ -1398,16 +1414,33 @@ static const __u8 *asus_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 	}
 
 	if ((drvdata->quirks & QUIRK_ZENBOOK_DUO_KEYBOARD) &&
-	    hid_is_usb(hdev) &&
-	    to_usb_interface(hdev->dev.parent)->altsetting->desc.bInterfaceNumber == 4) {
+	    hid_is_usb(hdev)) {
+		const __u8 asus_vendor_page[] = { 0x06, 0x31, 0xff };
+		const __u8 keyboard_usage[] = { 0x05, 0x01, 0x09, 0x06 };
 		__u8 *new_rdesc;
 		size_t new_size = *rsize + sizeof(asus_fake_keyboard_rdesc);
+		u8 intf_number =
+			to_usb_interface(hdev->dev.parent)->altsetting->desc.bInterfaceNumber;
+
+		/*
+		 * Some firmware revisions put the dedicated vendor hotkey
+		 * interface at a different USB interface number. Inject only
+		 * when the descriptor is ASUS-vendor-only, rather than assuming
+		 * the interface number is always 4.
+		 */
+		if (!asus_rdesc_contains(rdesc, *rsize, asus_vendor_page,
+					 sizeof(asus_vendor_page)) ||
+		    asus_rdesc_contains(rdesc, *rsize, keyboard_usage,
+					sizeof(keyboard_usage)))
+			goto skip_zenbook_duo_fake_keyboard;
 
 		new_rdesc = devm_kzalloc(&hdev->dev, new_size, GFP_KERNEL);
 		if (!new_rdesc)
 			return rdesc;
 
-		hid_info(hdev, "Injecting virtual Zenbook Duo keyboard usage page\n");
+		hid_info(hdev,
+			 "Injecting virtual Zenbook Duo keyboard usage page on USB interface %u\n",
+			 intf_number);
 
 		memcpy(new_rdesc, asus_fake_keyboard_rdesc,
 		       sizeof(asus_fake_keyboard_rdesc));
@@ -1416,6 +1449,7 @@ static const __u8 *asus_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 		*rsize = new_size;
 		rdesc = new_rdesc;
 	}
+skip_zenbook_duo_fake_keyboard:
 
 	if (drvdata->quirks & QUIRK_G752_KEYBOARD &&
 		 *rsize == 75 && rdesc[61] == 0x15 && rdesc[62] == 0x00) {
